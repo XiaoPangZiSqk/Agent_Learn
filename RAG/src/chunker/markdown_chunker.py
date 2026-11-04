@@ -2,7 +2,7 @@
 Markdown 切分器
 """
 from dataclasses import dataclass
-from core_line.chunk import ChunkTool
+from core_line.chunk import chunk_tool
 
 
 @dataclass
@@ -22,7 +22,7 @@ class Chunk:
 
     @property
     def tokens(self) -> int:
-        return ChunkTool.predic_token(self.text)
+        return chunk_tool.predic_token(self.text)
 
 
 # ============================================================
@@ -31,12 +31,12 @@ class Chunk:
 def _fence_wrap(text: str) -> tuple[str, str]:
     """识别已包裹围栏的代码块，返回 (头, 尾)，用于超长时按行重包。"""
     first, sep, rest = text.partition("\n")
-    m = ChunkTool._FENCE.match(first)
+    m = chunk_tool._FENCE.match(first)
     if not m or not sep:
         return None
     marker = m.group(2)[0] * 3
     last = rest.split("\n")[-1].strip()
-    tail = last if ChunkTool._FENCE_LINE.match(last) else marker
+    tail = last if chunk_tool._FENCE_LINE.match(last) else marker
     return first, tail
 
 
@@ -49,8 +49,8 @@ class MarkdownChunker:
     overlap  : 相邻块重叠预算（自动吸附到句子边界）
     """
 
-    def __init__(self, target: int = ChunkTool.CHUNK_SIZE, max_size: int = ChunkTool.MAX_CHUNK_SIZE,
-                 min_size: int = ChunkTool.MIN_CHUNK_SIZE, overlap: int = ChunkTool.OVERLAP):
+    def __init__(self, target: int = chunk_tool.CHUNK_SIZE, max_size: int = chunk_tool.MAX_CHUNK_SIZE,
+                 min_size: int = chunk_tool.MIN_CHUNK_SIZE, overlap: int = chunk_tool.OVERLAP):
         assert 0 < target <= max_size, "target 必须 <= max_size"
         self.target = target
         self.max_size = max_size
@@ -59,10 +59,10 @@ class MarkdownChunker:
 
     # ---------- 主入口 ----------
     def chunk(self, md: str) -> list[Chunk]:
-        blocks = ChunkTool.parse_markdown(md)
+        blocks = chunk_tool.parse_markdown(md)
         out: list[Chunk] = []
         for path, section in self._split_sections(blocks):
-            units = self._pack_blocks(section, path) 	#section:list[Block] , path:( , , ...)
+            units = self._pack_blocks(section, path) 	#section:list[Block] , path:(str, ...)
             out.extend(self._apply_overlap(units))
         out = self._merge_small(out)
         for i, c in enumerate(out):
@@ -71,9 +71,9 @@ class MarkdownChunker:
 
     # ---------- 标题分节：每个标题开启新节 ----------
     @staticmethod
-    def _split_sections(blocks: list[ChunkTool.Block]):
+    def _split_sections(blocks: list[chunk_tool.Block]) -> list[tuple[tuple[str, ...], list[chunk_tool.Block]]]:
         """
-        找出某一标题路径下的所有block，封装成(path, Blocks)
+        找出某一标题路径下的所有block，封装成(path, Blocks)加入到list中。
         """
         sections, cur, cur_path = [], [], ()
         for b in blocks:
@@ -90,17 +90,23 @@ class MarkdownChunker:
         return sections
 
     # ---------- 节内装箱 ----------
-    def _pack_blocks(self, blocks: list[ChunkTool.Block], path) -> list[Chunk]:
+    def _pack_blocks(self, blocks: list[chunk_tool.Block], path) -> list[Chunk]:
         """
-        将多个
+        将某一标题路径下的所有blocks组装成Chunk, 可能有多个。
+
+        param:
+            blocks:某一标题路径下的所有blocks
+            path: 某一标题路径
         """
-        chunks: list[Chunk] = []
-        cur: list[ChunkTool.Block] = []	# 组合成chunk所需的block块
+        chunks: list[Chunk] = []    # 组装的Chunk
+        cur: list[chunk_tool.Block] = []	# 组合成chunk所需的block块
         cur_tokens = 0
 
         def flush() -> None:
-            """将多个block合成一个chunk"""
-            nonlocal cur, cur_tokens
+            """将多个block合成 一个chunk"""
+
+            # nonlocal 是 Python 中用于嵌套函数（闭包）场景的关键字，作用是让内层函数能够修改外层函数（非全局）作用域中的变量。
+            nonlocal cur, cur_tokens    # 声明使用外层的 cur,cur_tokens
             if not cur:
                 return
             items = [(b.content, b.start, b.end) for b in cur]
@@ -109,7 +115,7 @@ class MarkdownChunker:
             cur, cur_tokens = [], 0
 
         for b in blocks:
-            tk = ChunkTool.predic_token(b.content)
+            tk = chunk_tool.predic_token(b.content)
             if b.atomic:
                 # 原子块：允许把块撑到 target~max，也不切中；超 max 才降级切
                 if tk > self.max_size:
@@ -145,19 +151,19 @@ class MarkdownChunker:
                      block_types=types)
 
     # ---------- 超长原子块降级 ----------
-    def _split_atomic(self, b: ChunkTool.Block, path) -> list[Chunk]:
+    def _split_atomic(self, b: chunk_tool.Block, path) -> list[Chunk]:
         if b.type == "code":
             return self._split_code(b, path)
         if b.type == "table":
             return self._split_table(b, path)
         return self._split_lines(b, path)
 
-    def _split_code(self, b: ChunkTool.Block, path) -> list[Chunk]:
+    def _split_code(self, b: chunk_tool.Block, path) -> list[Chunk]:
         lines = b.content.split("\n")
         if len(lines) < 3:
             return self._split_lines(b, path)
         head, tail = lines[0], lines[-1]
-        if not ChunkTool._FENCE_LINE.match(tail):
+        if not chunk_tool._FENCE_LINE.match(tail):
             tail = ("`" * 3) if "`" in head else ("~" * 3)
             inner = lines[1:]
         else:
@@ -186,18 +192,18 @@ class MarkdownChunker:
             cursor = idx + len(body)
         return self._pack_pieces(items, path, "code")
 
-    def _split_table(self, b: ChunkTool.Block, path) -> list[Chunk]:
+    def _split_table(self, b: chunk_tool.Block, path) -> list[Chunk]:
         lines = b.content.split("\n")
         if len(lines) < 3:
             return self._split_lines(b, path)
         head, delim, rows = lines[0], lines[1], lines[2:]
-        if ChunkTool.predic_token(head + delim) > self.max_size:
+        if chunk_tool.predic_token(head + delim) > self.max_size:
             return self._split_lines(b, path)
 
-        head_tk = ChunkTool.predic_token(head + "\n" + delim)
+        head_tk = chunk_tool.predic_token(head + "\n" + delim)
         groups, cur, cur_t = [], [], head_tk
         for r in rows:                          # 行级装箱
-            tk = ChunkTool.predic_token(r)
+            tk = chunk_tool.predic_token(r)
             if cur and cur_t + tk > self.max_size:
                 groups.append(cur)
                 cur, cur_t = [], head_tk
@@ -218,21 +224,21 @@ class MarkdownChunker:
             cursor = idx + len(body)
         return self._pack_pieces(items, path, "table")
 
-    def _split_lines(self, b: ChunkTool.Block, path) -> list[Chunk]:
+    def _split_lines(self, b: chunk_tool.Block, path) -> list[Chunk]:
         items, cursor = [], 0
         for ln in b.content.split("\n"):
             idx = b.content.find(ln, cursor) if ln else cursor
             if idx < 0:
                 idx = cursor
-            items.append((ln, b.start + idx, b.start + idx + len(ln)))
+            items.append((ln, b.start + idx, b.start + idx + len(ln))) #(原始字符，起始位置，结束位置)
             cursor = idx + len(ln) + 1
         return self._pack_lines(items, path, b.type)
 
-    def _split_long(self, b: ChunkTool.Block, path) -> list[Chunk]:
-        sents = ChunkTool.split_sentences(b.content)
+    def _split_long(self, b: chunk_tool.Block, path) -> list[Chunk]:
+        sents = chunk_tool.split_sentences(b.content)    # 将该block的content按句子切分。
         if not sents:
             return self._split_lines(b, path)
-        joiner = "" if ChunkTool._HAS_CJK.search(b.content) else " "
+        joiner = "" if chunk_tool._HAS_CJK.search(b.content) else " "
         items, cursor = [], 0
         for s in sents:
             idx = b.content.find(s, cursor)
@@ -256,7 +262,7 @@ class MarkdownChunker:
             cur, cur_t = [], 0
 
         for text, s, e in items:
-            tk = ChunkTool.predic_token(text)
+            tk = chunk_tool.predic_token(text)
             if tk > self.max_size:
                 flush()
                 chunks.extend(self._pack_lines([(text, s, e)], path, kind,
@@ -289,7 +295,7 @@ class MarkdownChunker:
             cur, cur_t = [], 0
 
         for text, s, e in items:
-            tk = ChunkTool.predic_token(text)
+            tk = chunk_tool.predic_token(text)
             if cur and cur_t + tk > self.target:
                 flush()
             if not cur:
@@ -309,22 +315,22 @@ class MarkdownChunker:
                 tail = self._tail(prev.core, self.overlap)
                 if tail:
                     u.prefix = tail
-                    u.overlap_tokens = ChunkTool.predic_token(tail)
+                    u.overlap_tokens = chunk_tool.predic_token(tail)
             prev = u
         return units
 
     def _tail(self, text: str, budget: int) -> str:
-        sents = ChunkTool.split_sentences(text)
+        sents = chunk_tool.split_sentences(text)
         picked: list[str] = []
         total = 0
         for s in reversed(sents):
-            tk = ChunkTool.predic_token(s)
+            tk = chunk_tool.predic_token(s)
             if picked and total + tk > budget:
                 break
             picked.append(s)
             total += tk
         picked.reverse()
-        joiner = "" if ChunkTool._HAS_CJK.search(text) else " "
+        joiner = "" if chunk_tool._HAS_CJK.search(text) else " "
         return joiner.join(picked)
 
     # ---------- 小块合并：避免碎片 ----------
@@ -332,9 +338,9 @@ class MarkdownChunker:
         merged: list[Chunk] = []
         for c in chunks:
             if (merged
-                    and ChunkTool.predic_token(c.core) < self.min_size
+                    and chunk_tool.predic_token(c.core) < self.min_size
                     and merged[-1].heading_path[:1] == c.heading_path[:1]
-                    and ChunkTool.predic_token(merged[-1].core + c.core) <= self.target):
+                    and chunk_tool.predic_token(merged[-1].core + c.core) <= self.target):
                 p = merged[-1]
                 p.core = p.core + "\n\n" + c.core
                 p.end = max(p.end, c.end)

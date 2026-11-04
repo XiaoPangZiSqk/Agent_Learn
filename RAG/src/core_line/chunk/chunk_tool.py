@@ -94,16 +94,6 @@ def recursive_character_split(text:str = None, chunk_size = CHUNK_SIZE, overlap 
 #============================================================ 结构化/语法感知切分 ============================================================
 import re
 
-@dataclass
-class Block:
-    type: str                       # heading/paragraph/list/quote/code/table/hr/frontmatter
-    content: str
-    path: tuple[str, ...]           # 标题面包屑，含自身
-    start: int
-    end: int
-    level: int = 0
-    atomic: bool = False            # True 表示不允许从中间切开
-
 # ============================================================
 # 1. Markdown 结构解析：行扫描 -> Block
 # 这些正则共同构成 Markdown 结构解析的"感官层"：
@@ -112,14 +102,16 @@ class Block:
 # 先吃原子块，再吃行块，最后才归入段落。
 # ============================================================
 _HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")								# ATX 标题（#~`######`）
-_FENCE = re.compile(r"^(\s*)(`{3,}|~{3,})\s*(\S*)\s*$")								# 代码围栏开始行
+_FENCE = re.compile(r"^(\s*)(`{3,}|~{3,})\s*(\S*)\s*$")								# 代码围栏开始行     ```python 、~~~json、裸  ```  都能识别
 _FENCE_LINE = re.compile(r"^\s*(`{3,}|~{3,})\s*$")									# 纯围栏行（无语言名）
 _LIST = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+\S")									# 列表项行
-_QUOTE = re.compile(r"^\s*>\s?")													# 引用行
+_QUOTE = re.compile(r"^\s*>\s?")													# 引用行 > 
 _HR = re.compile(r"^\s*(?:(?:-{3,})|(?:\*{3,})|(?:_{3,}))\s*$")						# 水平分割线 ---
 _SETEXT = re.compile(r"^\s*(={3,}|-{3,})\s*$")										# Setext 下划线 ===
 _TBL_DELIM = re.compile(r"^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$")			# GFM 表格分隔行
 _SENT_SPLIT = re.compile(r"(?<=[。！？；;!?])|(?<=[.!?])(?=\s+[A-Z0-9\"'(\[])")		# 句子边界（零宽）
+
+_HAS_CJK = re.compile(r"[\u4e00-\u9fff]")       # 用于判断文本里是否含中日韩统一表意文字（汉字）的小工具，字符类：匹配"一个"落在该 Unicode 区间的字符
 
 
 @dataclass
@@ -135,7 +127,7 @@ class Block:
 
 def parse_markdown(md: str) -> list[Block]:
     """
-    切分markdown，除去表格，代码块等需要完全保留的内容分装成一个Block外，都是一行封装成一个Block外
+    切分markdown，将整篇文档切分成 标题/段落/列表/引用/代码/表格/分割线/前置内容 Block块，段落是指
     """
     lines = md.splitlines()
     offsets, pos = [], 0
@@ -154,7 +146,7 @@ def parse_markdown(md: str) -> list[Block]:
         param:
             kind:类型
             s: 开始行
-            e: 结束行
+            e: 结束行(包含)
         """
         blocks.append(Block(
             type=kind,
@@ -243,6 +235,7 @@ def parse_markdown(md: str) -> list[Block]:
             continue
 
         # 段落（含 setext 标题：文字行后紧跟 === 或 ---）
+        # 夹在标题、代码块、引用、列表、表格之间的普通行组成一个Block，类型为段落
         j = i
         while j < n and lines[j].strip():
             if j > i and (_HEADING.match(lines[j]) or _FENCE.match(lines[j])
