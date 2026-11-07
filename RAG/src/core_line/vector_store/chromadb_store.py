@@ -95,7 +95,7 @@ class ChromaVector:
     # ---------------------------------------------------------------- 写入
     def add_records(self, records: Sequence[Mapping[str, Any]], *,
                     batch_size: int = WRITE_BATCH_SIZE) -> list[str]:
-        """写入 to_records() 产出的 chunk 记录，返回写入的 id 列表。
+        """写入 由markdown_chunker.py中 to_records() 产出的 chunk 记录，返回写入的 id 列表。
 
         param:
             records: 记录列表，每条至少包含 text，建议含 doc_id/chunk_id
@@ -103,6 +103,9 @@ class ChromaVector:
 
         说明：
             同 id 写入会覆盖旧记录（upsert），重复构建索引不会产生副本。
+            to_records()返回的dict列表中没有 id 键，所以会执行 _make_id():
+                由 doc_id 与 chunk_id 生成稳定 id，保证重复写入可覆盖。
+
         """
         if isinstance(records, Mapping):
             raise TypeError("add_records 接收记录列表，单条记录请包成 [record]")
@@ -324,7 +327,7 @@ class ChromaVector:
         space = hnsw.get("space") if isinstance(hnsw, Mapping) else None
         if space and space != self.DISTANCE_SPACE:
             logger.warning(
-                "集合 %s 已存在且距离度量为 %s，score 仍按 1 - distance 计算，可能失真",
+                "集合 %s 已存在且距离度量为 %s，若score 不按 1 - distance 计算，可能失真",
                 self.collection_name, space,
             )
         return collection

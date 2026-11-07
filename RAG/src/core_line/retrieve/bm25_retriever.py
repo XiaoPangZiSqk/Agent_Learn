@@ -79,12 +79,12 @@ class BM25Retriever:
         self.k1 = k1
         self.b = b
 
-        self._ids: list[str] = []
-        self._tokens: list[list[str]] = []
-        self._metas: list[dict[str, Any]] = []
-        self._texts: list[str] = []
-        self._manifest: dict[str, dict[str, Any]] = {}
-        self._index: _BM25Index | None = None
+        self._ids: list[str] = []                           # chunk 唯一 id
+        self._tokens: list[list[str]] = []                  # tokenize(text) 的分词结果
+        self._metas: list[dict[str, Any]] = []              # record 去掉 id/text 后的全部字段（含 doc_id、chunk_id、路径等）
+        self._texts: list[str] = []                         # chunk 原始正文
+        self._manifest: dict[str, dict[str, Any]] = {}      # 文档级清单，doc_id -> {"chunks": 该文档 chunk 数, "hash": 按 id 排序后的文本指纹, "updated_at": 时间}
+        self._index: _BM25Index | None = None               # _BM25Index，纯内存 BM25 统计量
         self._loaded = False
 
     # ---------------------------------------------------------------- 对外属性
@@ -365,7 +365,7 @@ class BM25Retriever:
         if doc_id is None:
             raise ValueError(f"第 {index} 条记录缺少 doc_id")
 
-        record_id = record.get("id")
+        record_id = record.get("id","")
         if record_id:
             record_id = str(record_id)
         elif record.get("chunk_id") is not None:

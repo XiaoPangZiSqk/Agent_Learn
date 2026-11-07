@@ -6,8 +6,12 @@
 加载数据(load_file) -> 切分(chunk) -> 向量化(embedding) -> 索引构建/存储 -> 召回/检索(retrieve) -> 重排 -> 生成
 ```
 
-`bm25_retriever.py` 负责**关键词召回**通道：用 BM25 对 chunk 文本做词项匹配，
-与 `vector_store` 的稠密向量召回互为补充，最终由融合层（尚未实现）合并两路结果。
+`bm25_retriever.py` 与 `fts5_retriever.py` 是**关键词召回**通道的两个实现：前者用「本地分词缓存 + 内存 BM25 统计量」，
+后者用「SQLite FTS5 单文件倒排索引」。两者都对 chunk 文本做词项匹配，与 `vector_store` 的稠密向量召回互为补充，
+最终由融合层（尚未实现）合并各路结果。两者消费同一批 records、返回同一结构，可以互换或并列使用。
+
+- 第一至十章：`bm25_retriever.py`（BM25 本地缓存方案）
+- 第十一章：`fts5_retriever.py`（SQLite FTS5 方案）
 
 ## 一、设计目标与边界
 
@@ -302,3 +306,130 @@ assert hits, "关键词召回为空"
 assert all({"id", "text", "metadata", "score"} <= set(h) for h in hits)
 assert hits == sorted(hits, key=lambda h: h["score"], reverse=True)
 ```
+
+## 十一、FTS5 关键词通道
+
+`fts5_retriever.py` 把分词结果写进 **SQLite FTS5** 倒排索引：匹配、打分（`bm25()`）、元数据过滤、截断
+全部在 SQL 内完成，查询期不需要把语料加载进 Python 内存。
+
+### 11.1 与 BM25 通道的差异
+
+| 维度 | `BM25Retriever` | `FTS5Retriever` |
+|---|---|---|
+| 索引载体 | `docs.pkl` + 两个 json | 单个 `fts5.db` |
+| 分词结果 | 全量常驻内存 | 存表，按需读取 |
+| 打分 | 手写 `_BM25Index` | FTS5 内置 `bm25()`，支持列权重 |
+| 元数据过滤 | Python 侧（打分后、排序前） | 下推 SQL（先过滤、再排序截断） |
+| 返回条数 | 过滤严格时可能少于 `top_k` | 有足够命中时总是满 `top_k` |
+| 增量成本 | 每次 `build` 重建全部统计量 | 只重写变动文档对应的倒排行 |
+| 构建原子性 | 依赖 `meta.json` 提交标记 | 单事务，DDL + 写入一起提交或回滚 |
+| 并发读 | 进程内各持一份内存快照 | WAL 模式下多进程可同时读 |
+
+共同点：复用同一套 `core_line.embedding.tokenizer`、支持同一套 Chroma 风格 `where`、
+返回同样的 `[{id, text, metadata, score}]`，分数同样**不能**与 cosine 比较（融合请用 RRF）。
+
+### 11.2 为什么先分词再入库
+
+FTS5 自带的 `unicode61` 会把连续汉字当成一个整词（`向量检索` 只产出 1 个 token），子查询 `检索` 命中不了；
+按字符切又会丢失词义。因此沿用项目已有的 jieba 分词：
+
+```
+text ──tokenize()──► ["安装", "chroma", "hnsw", "参数"]
+                          │ 空格拼接
+                          ▼
+                 "安装 chroma hnsw 参数"  ──► body_tokens 列
+```
+
+FTS5 侧只需 `unicode61` 按空白切分，**不依赖自定义 tokenizer**（Python 的 `sqlite3` 也无法注册）。
+代价是分词规则一变就必须重建，这一点由 `TOKENIZER_VERSION` 校验兜住。
+
+### 11.3 表结构
+
+```
+data/fts5_index/fts5.db
+├── chunks       正表：id / doc_id / chunk_id / heading_path / text / 分词列 / meta(JSON)
+├── chunks_fts   FTS5 虚拟表：body_tokens、heading_tokens（content='chunks' 外部内容）
+├── docs         文档清单：doc_id / chunks / hash / updated_at
+└── meta         单行 JSON：结构与分词器版本、列权重、统计量、构建时间
+```
+
+- **外部内容表**：`content='chunks'` 让分词结果只存一份，索引不重复存正文；
+- **触发器**：insert / delete / update 三个触发器保持正表与倒排索引同步，Python 侧无需手工维护；
+- **指纹**：`docs.hash` 为 `blake2b(id + text)`，与 BM25 的 manifest 同算法，用于跳过未变动文档。
+
+### 11.4 查询表达式
+
+| 环节 | 处理 |
+|---|---|
+| 分词 | `tokenize(query)`，与建库完全同一套规则 |
+| 去重 | 保序去重，避免子词扩展重复加权 |
+| 组装 | 每个词加双引号后 `OR` 连接：`"配置" OR "hnsw"` |
+| 加引号的原因 | `err_conn_refused`、`v1.2.3` 里的 `-` `.` `_` 会被 FTS5 当成语法符号 |
+| 用 OR 而非 AND | 与 BM25「多词命中累加分」对齐，命中词多的排前面 |
+| 列权重 | `bm25(chunks_fts, 1.0, 0.4)`：正文 1.0、标题 0.4 |
+
+### 11.5 召回 SQL
+
+```sql
+SELECT c.id, c.text, c.meta, -bm25(chunks_fts, ?, ?) AS score
+FROM chunks_fts
+JOIN chunks AS c ON c.rowid = chunks_fts.rowid
+WHERE chunks_fts MATCH ?
+  AND <where 编译出的条件>
+ORDER BY score DESC, c.id ASC
+LIMIT ?
+```
+
+`bm25()` 返回「越小越好」的负值，取负号后与其它通道「分数越大越相关」的约定一致。
+
+### 11.6 where 下推
+
+| 字段 | SQL 表达式 |
+|---|---|
+| `doc_id` / `chunk_id` / `heading_path` | 独立列，直接比较 |
+| 其它字段 | `json_extract(c.meta, ?)` |
+
+操作符与 `BM25Retriever` 一致：`$eq/$ne/$in/$nin/$gt/$gte/$lt/$lte/$and/$or`。
+`$ne` 用 `IS NOT`、`$nin` 额外放行 `NULL`，保证「字段缺失」时的判断与 Python 侧相同。
+字段名需匹配 `^[A-Za-z_][A-Za-z0-9_]*$`：`json_extract` 的路径无法参数化绑定，先约束再拼接。
+
+### 11.7 使用示例
+
+```python
+from core_line.retrieve.fts5_retriever import FTS5Retriever
+
+fts = FTS5Retriever("data/fts5_index")     # 传目录时自动拼 fts5.db
+fts.build(records)                         # 构建期：与 store.add_records、bm25.build 并列
+fts.build(records)                         # 内容未变：命中指纹，stats["skipped"] 列出全部文档
+
+fts = FTS5Retriever()
+if not fts.load():
+    raise RuntimeError("FTS5 索引缺失，请先构建")
+
+hits = fts.search("配置 HNSW 参数", top_k=20)
+hits = fts.search("召回策略", top_k=20, where={
+    "$and": [{"doc_id": "retrieve.md"}, {"tokens": {"$gte": 200}}],
+})
+```
+
+### 11.8 运维与验证
+
+| 变更 | 是否需要 `rebuild=True` |
+|---|---|
+| 新增 / 删除文档 | 否，`build(records)` 按 `doc_id` 覆盖 |
+| 文档内容变化 | 否，指纹不一致会自动重写 |
+| `tokenizer.py` 规则变化 | 是（`TOKENIZER_VERSION` 拦截） |
+| 表结构变化（`SCHEMA_VERSION`） | 是 |
+| 调整 `body_weight` / `heading_weight` | 否，权重只在查询期生效 |
+
+| 检查项 | 期望 |
+|---|---|
+| 重复 `build` 同一批 records | `len(fts)` 不增长，`skipped` 覆盖全部文档 |
+| 文档变短后重建 | 旧 `chunk_id` 不再被召回 |
+| 新进程 `load()` | 返回 `True`，检索结果与构建进程一致 |
+| 不存在的词 | 返回 `[]`，不抛异常 |
+| 非法 `where` | 立即 `ValueError`，即使无命中也要报错 |
+| `fts.clear()` 后 `load()` | 返回 `False`，`.db` / `-wal` / `-shm` 一并删除 |
+
+注意：`sqlite3` 连接不跨线程，多线程场景请每个线程创建实例；并发写靠 `busy_timeout=5000` 兜底，
+批量重建仍建议单进程执行。
