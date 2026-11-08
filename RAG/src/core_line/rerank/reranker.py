@@ -51,8 +51,9 @@
         print(item["rerank_rank"], item["original_rank"], item["rerank_score"], item["id"])
 
 注意：
-    * 默认打分器走百炼 TextReRank，需要 API Key（构造传 api_key 或环境变量
-      DASHSCOPE_API_KEY / BAILIAN_RERANK_API_KEY）；
+    * 默认打分器走百炼 TextReRank，需要 API Key（构造传 api_key，或按统一读取链
+      BAILIAN_RERANK_API_KEY -> BAILIAN_EMBEDDING_API_KEY -> DASHSCOPE_API_KEY 解析，
+      见 core_line/config.py）；
     * qwen3-rerank 限制：单条文档 4,000 token、单次请求 500 条 / 120,000 token；
       超长文本服务端直接返回 400（不会截断），请保证 chunk 在上限内；
       gte-rerank 已于 2026-05-30 下线，模型名请用 qwen3-rerank / qwen3.7-text-rerank /
@@ -66,19 +67,26 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 from http import HTTPStatus
 from typing import Any, Mapping, Protocol, Sequence
-
-from dotenv import load_dotenv
 
 try:
     import dashscope
 except ImportError:  # 允许未安装 SDK 时仅注入自定义打分器
     dashscope = None
 
-load_dotenv()
+try:  # 以 RAG/src 为导入根（与 RagApp.py 保持一致）
+    from core_line.config import bailian_key_hint, find_bailian_api_key
+    from core_line.config import get_bailian_base_url, get_rerank_model
+    from core_line.cache import SemanticCache, get_default_cache
+    from core_line.cache import make_key, normalize_query, text_fingerprint
+except ImportError:  # 作为包的一部分导入时的兜底
+    from ..config import bailian_key_hint, find_bailian_api_key
+    from ..config import get_bailian_base_url, get_rerank_model
+    from ..cache import SemanticCache, get_default_cache
+    from ..cache import make_key, normalize_query, text_fingerprint
+
 logger = logging.getLogger(__name__)
 
 # 可重试状态码：限流 + 服务端错误
@@ -94,7 +102,7 @@ class RerankScorer(Protocol):
 class BaiLianRerankScorer:
     """百炼（DashScope）交叉编码重排打分器（默认 qwen3-rerank）。"""
 
-    MODEL = os.getenv("BAILIAN_RERANK_MODEL", "qwen3-rerank")
+    MODEL = get_rerank_model()   # BAILIAN_RERANK_MODEL，缺省 qwen3-rerank（集中读取见 core_line/config.py）
     DEFAULT_BATCH_SIZE = 50   # 默认单次请求文档条数
     MAX_BATCH_SIZE = 500      # 单次请求文档条数上限（qwen3 系列）
     MAX_DOC_TOKENS = 4000     # 单条文档 token 上限，超限服务端返回 400（不截断）
@@ -109,24 +117,31 @@ class BaiLianRerankScorer:
         retry_backoff: float = 1.0,
         max_retry_delay: float = 8.0,
         request_interval: float = 0.0,
+        base_url: str | None = None,
+        cache: SemanticCache | None = None,
     ):
         """
         param:
-            api_key: 百炼 API Key，缺省读取环境变量 DASHSCOPE_API_KEY / BAILIAN_RERANK_API_KEY
-            model: 重排模型名，默认 qwen3-rerank（gte-rerank 已下线勿用）
+            api_key: 百炼 API Key，缺省按统一读取链解析（见 core_line/config.py）：
+                BAILIAN_RERANK_API_KEY -> BAILIAN_EMBEDDING_API_KEY -> DASHSCOPE_API_KEY
+            model: 重排模型名，缺省读 BAILIAN_RERANK_MODEL（默认 qwen3-rerank，gte-rerank 已下线勿用）
             batch_size: 单次请求文档条数，1~500
             max_retries: 单批最大尝试次数（含首次）
             retry_backoff: 退避基数，第 n 次重试等待 retry_backoff * 2^(n-1) 秒
             max_retry_delay: 单次退避等待上限（秒）
             request_interval: 两次请求之间的固定间隔（秒），用于主动限流
+            base_url: 百炼 API 基址覆盖，缺省读 BAILIAN_BASE_URL（兼容模式地址
+                自动转换为原生 /api/v1 基址），未配置则走 SDK 公网默认端点
+            cache: 语义缓存实例（(query, 文本) 打分结果缓存）；None 走默认缓存，
+                禁用可传 SemanticCache(enabled=False)
         """
         if dashscope is None:
             raise ImportError("缺少 dashscope SDK：请安装 dashscope，或为 CrossEncoderReranker 注入自定义 scorer")
-        self.api_key = (api_key
-                        or os.getenv("BAILIAN_RERANK_API_KEY")
-                        or os.getenv("DASHSCOPE_API_KEY"))
+        self.api_key = api_key or find_bailian_api_key()
         if not self.api_key:
-            raise ValueError("缺少百炼 API Key：请传入 api_key 或设置环境变量 DASHSCOPE_API_KEY")
+            raise ValueError(bailian_key_hint())
+        self.base_url = base_url or get_bailian_base_url()
+        self._cache = get_default_cache() if cache is None else cache
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model 不能为空")
         if not 1 <= batch_size <= self.MAX_BATCH_SIZE:
@@ -159,12 +174,32 @@ class BaiLianRerankScorer:
 
         self._validate_texts(texts)
 
-        scores: list[float] = []
-        for start in range(0, len(texts), self.batch_size):
-            batch = texts[start:start + self.batch_size]
-            scores.extend(self._score_batch(query, batch))
-            logger.debug("已精排打分 %d/%d 条候选", len(scores), len(texts))
-        return scores
+        q_key = normalize_query(query)
+        keys = [make_key("rerank", self.model, q_key, text_fingerprint(t)) for t in texts]
+        cached: dict[str, float] = {}
+        if self._cache:
+            cached = self._cache.get_many("rerank", keys)
+
+        scores: list[float | None] = [cached.get(k) for k in keys]
+        missing_pos = [i for i, k in enumerate(keys) if k not in cached]
+
+        if missing_pos:
+            missing_texts = [texts[i] for i in missing_pos]
+            fresh: list[float] = []
+            for start in range(0, len(missing_texts), self.batch_size):
+                batch = missing_texts[start:start + self.batch_size]
+                fresh.extend(self._score_batch(query, batch))
+                logger.debug("已精排打分 %d/%d 条候选", len(fresh), len(missing_texts))
+            if self._cache:
+                self._cache.set_many(
+                    "rerank", {keys[i]: s for i, s in zip(missing_pos, fresh)}
+                )
+            for i, s in zip(missing_pos, fresh):
+                scores[i] = s
+
+        logger.debug("精排打分完成：%d 条（缓存命中 %d，API %d）",
+                     len(texts), len(texts) - len(missing_pos), len(missing_pos))
+        return scores                        # type: ignore[return-value]
 
     # ---------------------------------------------------------------- 内部实现
     def _score_batch(self, query: str, texts: list[str]) -> list[float]:
@@ -176,6 +211,8 @@ class BaiLianRerankScorer:
             "api_key": self.api_key,
             "return_documents": False,   # 文本由调用方持有，减少返回负载
         }
+        if self.base_url:
+            payload["base_address"] = self.base_url   # dashscope 按次覆盖 API 基址（原生协议）
 
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -288,6 +325,7 @@ class CrossEncoderReranker:
         candidates: Sequence[Mapping[str, Any]],
         *,
         top_k: int | None = None,
+        fallback_on_error: bool = True,
     ) -> dict[str, Any]:
         """对融合候选做交叉编码精排，返回原始/精排对比结果。
 
@@ -296,11 +334,13 @@ class CrossEncoderReranker:
             candidates: 多路召回 + RRF 融合后的候选列表，每条至少含 text，
                 建议含 id / metadata / score（即 HybridRetriever.search 的输出）
             top_k: 精排后保留条数上限，None 表示全部返回；截断发生在打分与排序之后
+            fallback_on_error: 打分器失败/超时时降级为 RRF 排序直接进入生成
+                （保持原顺序、rerank_score 回填 original_score），而非全链路报错
 
         return:
-            {"query", "model", "count", "results"}；results 按 rerank_score 降序
-            （同分按 original_rank 升序），每条含 original_rank / rerank_rank /
-            original_score / rerank_score 对比字段，结构见模块文档
+            {"query", "model", "count", "results", "degraded", "error"}；results 按
+            rerank_score 降序（同分按 original_rank 升序），每条含 original_rank /
+            rerank_rank / original_score / rerank_score 对比字段，结构见模块文档
 
         说明：
             空候选返回 count=0 的空结果且不调用打分器；本层不去重（融合层职责）。
@@ -315,18 +355,24 @@ class CrossEncoderReranker:
         records = self._normalize(list(candidates))
         if not records:
             logger.debug("精排候选为空，返回空结果")
-            return {"query": query, "model": self.model, "count": 0, "results": []}
+            return {"query": query, "model": self.model, "count": 0,
+                    "results": [], "degraded": False, "error": None}
 
-        raw_scores = list(self._scorer.score(query, [record["text"] for record in records]))
-        if len(raw_scores) != len(records):
-            raise RuntimeError(
-                f"打分器返回 {len(raw_scores)} 条分数，与候选数 {len(records)} 不一致"
-            )
-        for index, value in enumerate(raw_scores):
-            try:
-                records[index]["rerank_score"] = float(value)
-            except (TypeError, ValueError) as exc:
-                raise RuntimeError(f"打分器第 {index} 条分数不是数值: {value!r}") from exc
+        try:
+            raw_scores = list(self._scorer.score(query, [record["text"] for record in records]))
+            if len(raw_scores) != len(records):
+                raise RuntimeError(
+                    f"打分器返回 {len(raw_scores)} 条分数，与候选数 {len(records)} 不一致"
+                )
+            for index, value in enumerate(raw_scores):
+                try:
+                    records[index]["rerank_score"] = float(value)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(f"打分器第 {index} 条分数不是数值: {value!r}") from exc
+        except Exception as exc:
+            if not fallback_on_error:
+                raise
+            return self._degraded_result(query, records, exc, top_k)
 
         records.sort(key=lambda record: (-record["rerank_score"], record["original_rank"]))
         for new_rank, record in enumerate(records, start=1):
@@ -336,7 +382,34 @@ class CrossEncoderReranker:
         if top_k is not None:
             records = records[:top_k]
         logger.debug("精排完成：%d 条候选，返回 %d 条", total, len(records))
-        return {"query": query, "model": self.model, "count": total, "results": records}
+        return {"query": query, "model": self.model, "count": total, "results": records,
+                "degraded": False, "error": None}
+
+    @staticmethod
+    def _degraded_result(
+        query: str,
+        records: list[dict[str, Any]],
+        exc: Exception,
+        top_k: int | None,
+    ) -> dict[str, Any]:
+        """降级兜底：打分失败时保持 RRF 排序直接进入生成。"""
+        logger.warning("rerank 打分失败，降级为 RRF 排序直接进入生成: %s", exc)
+        for record in records:
+            original = record.get("original_score")
+            record["rerank_score"] = float(original) if isinstance(original, (int, float)) else 0.0
+            record["rerank_rank"] = record["original_rank"]
+        records.sort(key=lambda record: record["rerank_rank"])
+        total = len(records)
+        if top_k is not None:
+            records = records[:top_k]
+        return {
+            "query": query,
+            "model": "degraded:rrf-order",
+            "count": total,
+            "results": records,
+            "degraded": True,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
     # ---------------------------------------------------------------- 内部实现
     @staticmethod

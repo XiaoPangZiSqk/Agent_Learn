@@ -6,9 +6,18 @@ from dataclasses import dataclass
 import tiktoken
 
 MAX_CHUNK_SIZE = 560
-MIN_CHUNK_SIZE = 120
+MIN_CHUNK_SIZE = 100       # 小块合并阈值（target 的 1/4；过紧会产生 9~30 token 碎块）
 CHUNK_SIZE = 400
 OVERLAP = 60
+
+# ---------- 碎块兜底 ----------
+FRAGMENT_TOKENS = 60       # 合并后仍小于此值的块打 fragment=true 标记，检索侧降权
+
+# ---------- 文档形态自适应（代码/围栏密集文档） ----------
+CODE_DENSE_THRESHOLD = 0.25    # 围栏/表格字符占比达到该值即视为代码密集文档
+CODE_DENSE_TARGET = 600        # 代码密集文档的目标块大小（让相邻代码块装进同块）
+CODE_DENSE_MAX = 840           # 对应硬上限（保持 target:max = 400:560 的比例）
+CODE_DENSE_MIN = 80            # 对应小块合并阈值
 
 #============================================================ token预测 ============================================================
 def predic_token(text: str) -> int:
@@ -27,68 +36,107 @@ def predic_token(text: str) -> int:
     return len(ids)
 
 #============================================================ 固定长度切分 ============================================================
-def fixed_len_split(text:str = None, chunk_size = CHUNK_SIZE, overlap = OVERLAP) -> list[str]:
-    """固定长度切分
-    param:
-        chunk_size: 块大小
-        overlap: 重叠部分
-    """
-    if not text :
-        return []
-    
-    sum_token = predic_token(text=text)
-    chunks, start = [], 0
-    while start < sum_token:
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        if end >= sum_token:
-            break
-        start = end - overlap   # 关键：步长 = chunk_size - overlap
-    return chunks
+def fixed_len_split(text: str = None, chunk_size = CHUNK_SIZE, overlap = OVERLAP) -> list[str]:
+    """固定长度切分（按 token 定长硬切，逐级降级后的最后兜底）
 
-#============================================================ 递归字符切分 ============================================================
-def recursive_character_split(text:str = None, chunk_size = CHUNK_SIZE, overlap = OVERLAP, separators:list|None=None, level = 0) -> list[str]:
-    """递归字符切分：优先自然边界，逐级降级，最后定长硬切兜底"""
-    seps = separators or ["\n\n", "\n", "。", "；", "，", " ", ""]
+    param:
+        text: 待切分文本
+        chunk_size: 每块的 token 数（注意是 token，不是字符数）
+        overlap: 相邻块重叠的 token 数，必须 < chunk_size
+
+    return:
+        list[str]，每块 token 数 <= chunk_size；步长 = chunk_size - overlap
+
+    说明：
+        按 tiktoken o200k_base 的 token 边界硬切，不保证语义完整；
+        极端情况下可能把多字节字符/单词切在两块交界处（定长硬切的固有取舍）。
+    """
+    if not text:
+        return []
     if not 0 <= overlap < chunk_size:
         raise ValueError("overlap 必须满足 0 <= overlap < chunk_size")
 
-    def rec(t:str,sepc:list, level = level):
-        if not text :
+    enc = tiktoken.get_encoding("o200k_base")
+    ids = enc.encode(text)
+    step = chunk_size - overlap
+    chunks: list[str] = []
+    start = 0
+    while start < len(ids):
+        piece = enc.decode(ids[start:start + chunk_size])
+        if piece:
+            chunks.append(piece)
+        if start + chunk_size >= len(ids):
+            break
+        start += step
+    return chunks
+
+#============================================================ 递归字符切分 ============================================================
+def recursive_character_split(text: str = None, chunk_size = CHUNK_SIZE, overlap = OVERLAP,
+                              separators: list | None = None, _depth: int = 0) -> list[str]:
+    """递归字符切分：优先自然边界，逐级降级，最后定长硬切兜底。
+
+    param:
+        text: 待切分文本
+        chunk_size: 每块 token 上限（按 predic_token 计量）
+        overlap: 相邻块重叠 token 数（取前块尾部 token 作后块开头）
+        separators: 边界分隔符列表，逐级降级使用；
+            缺省 ["\\n\\n", "\\n", "。", "；", "，", " ", ""]（空串表示定长硬切）
+        _depth: 当前降级深度（内部递归使用，外部调用无需传）
+
+    return:
+        list[str]，每块 token 数 <= chunk_size
+
+    说明：
+        size 一律按 token 计量；分隔符按层级降级，单片段仍超长时用下一层
+        分隔符递归切分，全部分隔符用尽后走 fixed_len_split 定长硬切兜底。
+    """
+    if not text:
+        return []
+    if not 0 <= overlap < chunk_size:
+        raise ValueError("overlap 必须满足 0 <= overlap < chunk_size")
+    seps = separators if separators is not None else ["\n\n", "\n", "。", "；", "，", " ", ""]
+
+    def tail_tokens(buf: str, n: int) -> str:
+        """取 buf 末尾 n 个 token 作为下一块的重叠前缀（token 级，不做字符下标）。"""
+        if n <= 0 or not buf:
+            return ""
+        enc = tiktoken.get_encoding("o200k_base")
+        ids = enc.encode(buf)
+        return enc.decode(ids[-n:])
+
+    def rec(t: str, depth: int) -> list[str]:
+        if not t:
             return []
-        
-        if predic_token(text=t) <= chunk_size :
-            return [text]    # 目前还不能确定元数据，在真正对一个文件切分时在导入。
+        if predic_token(t) <= chunk_size:
+            return [t]
+        if depth >= len(seps) or seps[depth] == "":
+            return fixed_len_split(t, chunk_size=chunk_size, overlap=overlap)
 
-        sep = seps[level]
-        if sep == "":
-            return fixed_len_split(chunk_size=chunk_size, overlap=overlap);
-
-        chunks, buf = [], ""
-        for p in t.split(sep=sep) :
-            candidate = f"{buf}{sep}{p}" if buf else p  # 文本候选池
-            if  predic_token(candidate) <= chunk_size : # 未满一个chunk
+        sep = seps[depth]
+        chunks: list[str] = []
+        buf = ""
+        for p in t.split(sep):
+            candidate = f"{buf}{sep}{p}" if buf else p
+            if predic_token(candidate) <= chunk_size:     # 未满一个 chunk
                 buf = candidate
                 continue
-            # candidate 大于 chunk，将缓存如chunk
-            if buf :
+            if buf:                                        # 当前块已满 -> 落盘
                 chunks.append(buf)
-                buf = buf[-overlap] if overlap else ""
-                candidate =f"{buf}{sep}{p}" if buf else p
-                if predic_token(candidate) <= chunk_size :  # 只有这里退出，才会进入下面的if
+                buf = tail_tokens(buf, overlap)            # 前块尾部 token 作重叠种子
+                candidate = f"{buf}{sep}{p}" if buf else p
+                if predic_token(candidate) <= chunk_size:
                     buf = candidate
                     continue
-            if predic_token(p) > chunk_size :       # 单片段仍超长 → 降级递归
-                chunks.extend(rec(p, sepc=sepc, level=level+1))
+            if predic_token(p) > chunk_size:               # 单片段仍超长 → 降级递归
+                chunks.extend(rec(p, depth + 1))
                 buf = ""
             else:
-                buf = p                   # 种子放不下则丢种子，保片段完整
+                buf = p                                    # 种子放不下则丢种子，保片段完整
+        if buf:
+            chunks.append(buf)
+        return chunks
 
-            if buf:
-                chunks.append(buf)
-            return chunks
-        
-        return rec(text, list(seps))
+    return rec(text, _depth)
 
 
 #============================================================ 结构化/语法感知切分 ============================================================

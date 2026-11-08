@@ -2,7 +2,7 @@
 
 本文档梳理 `RAG/` 的完整业务流程，覆盖各功能模块的职责与关系、主流程的先后顺序与关键节点、模块间的数据流向与依赖，以及每个阶段的关键输入与输出。
 
-内容依据当前 `src/` 下的实现与各模块 README 整理；标注为“待实现”的部分，对应当前目录为空或入口尚未编排的能力，便于团队区分“已落地”与“规划中”。
+内容依据当前 `src/` 下的实现与各模块 README 整理，与代码保持同步。
 
 ---
 
@@ -22,14 +22,16 @@
 | 能力 | 状态 | 说明 |
 |---|---|---|
 | 文档加载 | 可用 | 支持 `.md` / `.markdown`；`.pdf` / `.docx` 已注册但解析抛 `NotImplementedError` |
-| Markdown 结构化切分 | 可用 | `MarkdownChunker`，边界感知 + 重叠 + 小块合并 |
+| Markdown 结构化切分 | 可用 | `MarkdownChunker`，边界感知 + 重叠 + 小块合并 + 形态自适应 + 碎块标注 |
 | 记录标准化 | 可用 | `to_records()` 产出双通道共用的记录结构 |
 | 向量索引与检索 | 可用 | `ChromaVector`，本地持久化、cosine 距离 |
 | 关键词索引与检索 | 可用 | `BM25Retriever`，本地分词缓存 + 内存 BM25 统计 |
-| 构建流程编排 | 部分可用 | `RagApp.py` 目前只执行“加载 → 切分 → 打印”，尚未写入两个索引 |
-| 双路融合（RRF） | 待实现 | 仅在文档中约定接口与算法 |
-| 重排（rerank） | 待实现 | `core_line/rerank/` 为空目录 |
-| 生成（generate） | 待实现 | `core_line/generate/` 为空目录 |
+| 构建流程编排 | 部分可用 | `RagApp.py` 目前执行“启动预检 → 加载 → 切分 → 打印”，尚未写入两个索引 |
+| 双路融合（RRF） | 可用 | `HybridRetriever`，按排名 RRF 融合（`rrf_k=60`），带通道权重与碎块降权 |
+| 重排（rerank） | 可用 | `CrossEncoderReranker` + `BaiLianRerankScorer`（百炼 rerank），打分失败自动降级 RRF 排序 |
+| 生成（generate） | 可用 | `Generator`（DeepSeek）：SC 并行投票 + 引用核验 + NLI + Reflexion + SSE 流式 |
+| 查询流水线 | 可用 | `RagPipeline`（`core_line/pipeline.py`）：编排全链，支持批量并发与 SSE 阶段进度 |
+| 语义缓存 | 可用 | `SemanticCache`（`core_line/cache.py`）：嵌入 / rerank / 生成结果按哈希缓存（`RAG_CACHE_*`） |
 
 ---
 
@@ -46,7 +48,7 @@
                      │                        │
 召回层           向量召回（dense）        关键词召回（sparse）
                      └──────────┬─────────────┘
-融合/重排/生成层          RRF → rerank → generate（均待实现）
+融合/重排/生成层          RRF → rerank → generate
 ```
 
 ### 2.2 模块清单
@@ -61,8 +63,12 @@
 | 分词 | `src/core_line/embedding/tokenizer.py` | `tokenize`、`tokenize_batch`、`TOKENIZER_VERSION` | 供 BM25 建库与查询共用的中英文切词 | 文本 → `list[str]` |
 | 向量库 | `src/core_line/vector_store/chromadb_store.py` | `ChromaVector` | 记录写入、向量检索、读取与集合维护 | `records` / 查询文本 → 命中列表 |
 | 关键词召回 | `src/core_line/retrieve/bm25_retriever.py` | `BM25Retriever`、`_BM25Index` | BM25 缓存构建、加载、打分与元数据过滤 | `records` / 查询文本 → 命中列表 |
-| 重排 | `src/core_line/rerank/` | 无 | 预留：对召回结果精排 | 待定义 |
-| 生成 | `src/core_line/generate/` | 无 | 预留：拼装上下文并调用 LLM | 待定义 |
+| 融合 | `src/core_line/retrieve/retriever.py` | `HybridRetriever`、`RecallChannel` | 多路召回 + RRF 按排名融合，输出 channels 命中溯源 | 多路命中 → 融合列表 |
+| 重排 | `src/core_line/rerank/reranker.py` | `CrossEncoderReranker`、`BaiLianRerankScorer` | 交叉编码精排；打分失败降级 RRF 排序 | 融合候选、查询 → 精排 Top-N |
+| 生成 | `src/core_line/generate/generator.py` 等 | `Generator`、`ContextAssembler`、`NLIChecker` | 上下文组装、SC 并行投票、引用核验、NLI、Reflexion、SSE | 精排结果、查询 → 答案 + 引用 |
+| 流水线 | `src/core_line/pipeline.py` | `RagPipeline` | 编排召回→重排→生成，批量并发与 SSE 阶段进度 | 查询 → `PipelineResult` |
+| 缓存 | `src/core_line/cache.py` | `SemanticCache` | 嵌入 / rerank / 生成结果三级语义缓存（sqlite） | 哈希键 → 缓存值 |
+| 配置 | `src/core_line/config.py` | `preflight`、各 `get_*` | Key/模型/端点集中读取，启动预检 | 环境变量 → 配置快照 |
 
 ### 2.3 模块间协作关系
 
@@ -122,11 +128,11 @@ BM25Retriever
     └── tokenize    ──► BM25Retriever.search() ──► sparse hits
                                    │
                                    ▼
-                         RRF 融合（待实现）
+                         RRF 融合
                                    ▼
-                         rerank 精排（待实现）
+                         rerank 精排
                                    ▼
-                         generate 生成（待实现）
+                         generate 生成
 ```
 
 ---
@@ -328,7 +334,7 @@ RAG/data/
 
 ### 5.1 总览
 
-查询期主要包含三步：**向量召回 → 关键词召回 → 融合**（融合尚未实现）。
+查询期主要包含五步：**向量召回 → 关键词召回 → RRF 融合 → 重排 → 生成**。
 
 向量通道与关键词通道**可独立调用**，调用顺序不影响结果；融合层按 `id` 对齐两路命中。
 
@@ -366,23 +372,23 @@ RAG/data/
 
 **注意**：BM25 分数无固定上界，与 cosine `score` 量纲不同，**不能直接比较或相加**。
 
-### 5.4 阶段 Q3：融合（待实现）
+### 5.4 阶段 Q3：融合
 
-约定接口：
+**入口**：`HybridRetriever.search(query, top_k=10, where=None, channel_top_k=None)`
 
-| 项 | 约定 |
+| 项 | 实现 |
 |---|---|
-| 输入 | 两路各 `top_k` 条（建议各 20~50 条） |
-| 对齐键 | `id`（两通道 id 规则均为 `doc_id::chunk_id`） |
-| 算法 | RRF：`score(d) = Σ 1 / (k + rank_i(d))`，常用 `k = 60` |
-| 输出 | 统一结构的去重命中列表，保留两路原始分数供排查 |
+| 输入 | 各通道召回命中（缺省每路深度 20，`RecallChannel` 可配权重） |
+| 对齐键 | `id`（两通道 id 规则均为 `doc_id::chunk_id`），同通道重复 id 取最优排名 |
+| 算法 | RRF：`score(d) = Σ weight_c / (rrf_k + rank_c(d))`，`rrf_k = 60`，只看排名不看原始分 |
+| 输出 | `[{"id","text","metadata","score","channels"}]`，`channels[]` 保留各路命中详情；碎块（`fragment=true`）融合分 ×0.85 降权 |
 
 由于两路结果结构已对齐（`id` / `text` / `metadata` / `score`），融合层只需关注排名，不需要理解两路分数量纲。
 
-### 5.5 阶段 Q4 / Q5：重排与生成（待实现）
+### 5.5 阶段 Q4 / Q5：重排与生成
 
-- **rerank**：接收融合后的候选块，按 query 与块内容做精排，输出重排后的 Top-N；
-- **generate**：用重排结果拼装上下文（受“`top_k × chunk_size × (1 + 重叠率)` ≤ 上下文预算 50%”约束），调用 LLM 生成答案并附引用（`doc_id` + `heading_path` + `char_start/end`）。
+- **rerank**：`CrossEncoderReranker.rerank(query, candidates, top_k=5)`，默认打分器 `BaiLianRerankScorer`（百炼 rerank 交叉编码）；打分失败/超时自动降级为 RRF 排序直接进入生成（结果带 `degraded` 标记）；
+- **generate**：`ContextAssembler.assemble()` 先按 token 预算去重/截断/编号（`[n]` 引用锚点），再由 `Generator.generate()` 调用 DeepSeek 输出 JSON 结构化答案（含引用），经 Self-consistency 并行投票、引用核验、NLI 一致性检查（`nli_checked` 区分“通过/未检查”）与 Reflexion 修正后返回；生成失败降级为“上下文摘要 + 明确未生成”。流式场景走 `Generator.generate_stream()` 或 `RagPipeline.run_stream()`（SSE，首包优先）。
 
 ---
 
@@ -469,9 +475,9 @@ to_records
 | B4b 关键词入库 | `BM25Retriever.build` | `records` | 统计字典 | 是 | 重复 id / 缺少 doc_id 抛错 |
 | Q1 向量召回 | `ChromaVector.query` | 查询文本、`top_k`、过滤条件 | `[{id,text,metadata,distance,score}]` | 否 | 维度不符 / 空查询抛错 |
 | Q2 关键词召回 | `BM25Retriever.search` | 查询文本、`top_k`、`where` | `[{id,text,metadata,score}]` | 否 | 未加载索引抛错；无命中返回 `[]` |
-| Q3 融合 | 待实现 | 两路命中 | 统一排序列表 | 否 | — |
-| Q4 重排 | 待实现 | 融合结果、查询 | 精排 Top-N | 否 | — |
-| Q5 生成 | 待实现 | 精排结果、查询 | 答案 + 引用 | 否 | — |
+| Q3 融合 | `HybridRetriever.search` | 查询、两路命中 | 统一排序列表（RRF 分 + channels） | 否 | 通道异常原样上抛 |
+| Q4 重排 | `CrossEncoderReranker.rerank` | 融合候选、查询 | 精排 Top-N（含双排名双分数） | 否 | 打分失败降级 RRF 排序 |
+| Q5 生成 | `Generator.generate` | 精排结果、查询 | 答案 + 引用 + 自校验状态 | 否 | 生成失败降级为上下文摘要 |
 
 ---
 
@@ -503,11 +509,11 @@ to_records
 ### 8.3 当前实现缺口与风险
 
 1. **构建编排未完成**：`RagApp.py` 只打印切分结果，未调用 `ChromaVector.add_records` 与 `BM25Retriever.build`，因此两条索引实际上不会生成。
-2. **后段链路为空**：RRF 融合、`rerank/`、`generate/` 均未实现，系统当前只能返回两路原始召回结果。
+2. **查询链路未编排进入口**：RRF 融合、`rerank/`、`generate/` 均已实现，但 `RagApp.py` 未串联查询链路，需调用方自行组装（或直接使用 `core_line/pipeline.py` 的 `RagPipeline`）。
 3. **`doc_id` 取值偏弱**：当前使用文件名，跨目录同名文件会互相覆盖；建议改用相对路径或内容哈希。
 4. **向量侧缺少按文档清理**：`add_records` 只做 upsert，文档变短或切分参数调小后，旧的高位 `chunk_id` 不会被删除，会残留“幽灵块”。BM25 侧已按 `doc_id` 先删后写，向量侧需调用方显式 `delete(where={"doc_id": ...})` 后再写入。
 5. **多格式解析缺失**：PDF / Word 仅注册了后缀，解析方法仍抛 `NotImplementedError`。
-6. **备选切分器未接入且有缺陷**：`fixed_len_split` 以 token 总数作为字符下标使用（长文本块数偏多）；`recursive_character_split` 的外层返回值写在内层函数中，调用返回 `None`。两者均未进入主链路。
+6. **备选切分器未接入主链路**：`fixed_len_split` / `recursive_character_split` 的历史缺陷（token 数误当下标、返回值错位）已修复（均按 token 计量），但仍未接入主链路——主链路使用 `MarkdownChunker`。
 7. **目录归属不统一**：`chunker/` 在 `core_line/` 之外，通过导入根复用 `core_line/chunk`，迁移目录时需同步修改导入路径。
 
 ---

@@ -5,6 +5,7 @@
 data/chroma_data/
 data/bm25_index/
 data/fts5_index/
+data/cache/
 
 # 合成测试数据(由 scripts/generate_synthetic_data.py 生成,不入库)
 data/load_file/

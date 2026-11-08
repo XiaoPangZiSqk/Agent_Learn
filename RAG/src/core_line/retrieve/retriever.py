@@ -112,6 +112,7 @@ class HybridRetriever:
     DEFAULT_TOP_K = 10           # 融合后返回条数
     DEFAULT_CHANNEL_TOP_K = 20   # 每路通道的召回深度（各通道保持一致）
     DEFAULT_RRF_K = 60           # RRF 平滑常数
+    FRAGMENT_PENALTY = 0.85      # 碎块降权：fragment=true 的候选融合分打折（切分器标注）
 
     def __init__(
         self,
@@ -214,6 +215,11 @@ class HybridRetriever:
                     "rank": rank,
                     "score": hit.get("score"),
                 })
+
+        # 碎块降权：切分器标注的 fragment 候选稍作压制，避免碎块挤占头部
+        for entry in fused.values():
+            if entry["metadata"].get("fragment"):
+                entry["score"] *= self.FRAGMENT_PENALTY
 
         results = sorted(fused.values(), key=lambda item: (-item["score"], item["id"]))
         logger.debug("融合完成：%d 路通道，候选 %d 条，返回 %d 条",

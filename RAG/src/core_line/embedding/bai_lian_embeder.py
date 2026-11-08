@@ -16,14 +16,22 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 from http import HTTPStatus
 
 import dashscope
-from dotenv import load_dotenv
 
-load_dotenv()
+try:  # 以 RAG/src 为导入根（与 RagApp.py 保持一致）
+    from core_line.config import bailian_key_hint, find_bailian_api_key
+    from core_line.config import get_bailian_base_url, get_embedding_model
+    from core_line.cache import SemanticCache, get_default_cache
+    from core_line.cache import make_key, text_fingerprint
+except ImportError:  # 作为包的一部分导入时的兜底
+    from ..config import bailian_key_hint, find_bailian_api_key
+    from ..config import get_bailian_base_url, get_embedding_model
+    from ..cache import SemanticCache, get_default_cache
+    from ..cache import make_key, text_fingerprint
+
 logger = logging.getLogger(__name__)
 
 # 可重试状态码：限流 + 服务端错误
@@ -32,7 +40,7 @@ RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 class BaiLianEmbeder:
     """基于百炼 SDK 的文本向量化器（text-embedding-v4）。"""
 
-    MODEL = os.getenv("BAILIAN_EMBEDDING_MODEL", "text-embedding-v4")
+    MODEL = get_embedding_model()   # BAILIAN_EMBEDDING_MODEL，缺省 text-embedding-v4（集中读取见 core_line/config.py）
     MAX_BATCH_SIZE = 10          # 单次请求文本条数上限
     MAX_INPUT_TOKENS = 8192      # 单条文本 token 上限
     SUPPORTED_DIMENSIONS = (2048, 1536, 1024, 768, 512, 256, 128, 64)
@@ -49,21 +57,30 @@ class BaiLianEmbeder:
         retry_backoff: float = 1.0,
         max_retry_delay: float = 8.0,
         request_interval: float = 0.0,
+        base_url: str | None = None,
+        cache: SemanticCache | None = None,
     ):
         """
         param:
-            api_key: 百炼 API Key，缺省读取环境变量 DASHSCOPE_API_KEY
-            model: 向量模型名，默认 text-embedding-v4
+            api_key: 百炼 API Key，缺省按统一读取链解析（见 core_line/config.py）：
+                BAILIAN_RERANK_API_KEY -> BAILIAN_EMBEDDING_API_KEY -> DASHSCOPE_API_KEY
+            model: 向量模型名，缺省读 BAILIAN_EMBEDDING_MODEL（默认 text-embedding-v4）
             dimension: 输出维度，None 表示用模型默认（1024）
             batch_size: 单次请求文本条数，不能超过 10
             max_retries: 单批最大尝试次数（含首次）
             retry_backoff: 退避基数，第 n 次重试等待 retry_backoff * 2^(n-1) 秒
             max_retry_delay: 单次退避等待上限（秒）
             request_interval: 两次请求之间的固定间隔（秒），用于主动限流
+            base_url: 百炼 API 基址覆盖，缺省读 BAILIAN_BASE_URL（兼容模式地址
+                自动转换为原生 /api/v1 基址），未配置则走 SDK 公网默认端点
+            cache: 语义缓存实例（嵌入向量按文本指纹缓存）；None 走默认缓存
+                （RAG_CACHE_ENABLED 控制开关），禁用可传 SemanticCache(enabled=False)
         """
-        self.api_key = api_key or os.getenv("BAILIAN_EMBEDDING_API_KEY")
+        self.api_key = api_key or find_bailian_api_key()
         if not self.api_key:
-            raise ValueError("缺少百炼 API Key：请传入 api_key 或设置环境变量 DASHSCOPE_API_KEY")
+            raise ValueError(bailian_key_hint())
+        self.base_url = base_url or get_bailian_base_url()
+        self._cache = get_default_cache() if cache is None else cache
 
         if dimension is not None and dimension not in self.SUPPORTED_DIMENSIONS:
             raise ValueError(
@@ -120,12 +137,48 @@ class BaiLianEmbeder:
     # ---------------------------------------------------------------- 内部实现
     def _embed_batch(self, texts: list[str], *, text_type: str | None = None,
                      instruct: str | None = None) -> list[list[float]]:
+        """单批向量化：先查语义缓存，未命中再请求 API（带指数退避重试）。
+
+        文档 chunk 不变则向量不变，缓存命中零成本复用。
+        """
+        keys = [
+            make_key("emb", self.model, self.dimension, text_type, instruct, text_fingerprint(t))
+            for t in texts
+        ]
+        cached: dict[str, list[float]] = {}
+        if self._cache:
+            cached = self._cache.get_many("embedding", keys)
+
+        vectors: list[list[float] | None] = [cached.get(k) for k in keys]
+        missing_pos = [i for i, k in enumerate(keys) if k not in cached]
+
+        if missing_pos:
+            fresh = self._request_api(
+                [texts[i] for i in missing_pos], text_type=text_type, instruct=instruct
+            )
+            if self._cache:
+                self._cache.set_many(
+                    "embedding", {keys[i]: vec for i, vec in zip(missing_pos, fresh)}
+                )
+            for i, vec in zip(missing_pos, fresh):
+                vectors[i] = vec
+
+        logger.debug(
+            "嵌入完成：%d 条（缓存命中 %d，API %d）",
+            len(texts), len(texts) - len(missing_pos), len(missing_pos),
+        )
+        return vectors                        # type: ignore[return-value]
+
+    def _request_api(self, texts: list[str], *, text_type: str | None = None,
+                     instruct: str | None = None) -> list[list[float]]:
         """下单批请求，带指数退避重试。"""
         payload = {
             "model": self.model,
             "input": texts,
             "api_key": self.api_key,
         }
+        if self.base_url:
+            payload["base_address"] = self.base_url   # dashscope 按次覆盖 API 基址（原生协议）
         if self.dimension is not None:
             payload["dimension"] = self.dimension
         if text_type:

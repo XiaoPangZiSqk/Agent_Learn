@@ -12,9 +12,10 @@ class Chunk:
     start: int                                  # 在源文档中的字符偏移
     end: int
     block_types: tuple[str, ...]
-    prefix: str = ""                            # 重叠区（来自上一块句尾）
+    prefix: str = ""                            # 重叠区（上一块句尾/标题行/代码末行）
     overlap_tokens: int = 0
     index: int = -1
+    fragment: bool = False                      # 碎块标记：合并后仍 < FRAGMENT_TOKENS，检索侧降权
 
     @property
     def text(self) -> str:
@@ -45,26 +46,59 @@ class MarkdownChunker:
 
     target   : 目标块大小（软预算）
     max_size : 硬上限，超过必须在句子/行级切开
-    min_size : 小于该值的块尝试并入同根相邻块
-    overlap  : 相邻块重叠预算（自动吸附到句子边界）
+    min_size : 小于该值的块尝试并入相邻块（前后均可，跨根标题允许）
+    overlap  : 相邻块重叠预算（句尾吸附句子边界；标题/代码块取标题行或代码末行）
+
+    adaptive : 按文档形态自适应参数（代码/围栏密集文档自动放大 target 装箱预算）；
+               显式传入 target/max_size/min_size 任一参数时自适应自动关闭
     """
 
-    def __init__(self, target: int = chunk_tool.CHUNK_SIZE, max_size: int = chunk_tool.MAX_CHUNK_SIZE,
-                 min_size: int = chunk_tool.MIN_CHUNK_SIZE, overlap: int = chunk_tool.OVERLAP):
-        assert 0 < target <= max_size, "target 必须 <= max_size"
-        self.target = target
-        self.max_size = max_size
-        self.min_size = min_size
+    def __init__(self, target: int | None = None, max_size: int | None = None,
+                 min_size: int | None = None, overlap: int = chunk_tool.OVERLAP,
+                 adaptive: bool = True):
+        self._base_target = target if target is not None else chunk_tool.CHUNK_SIZE
+        self._base_max = max_size if max_size is not None else chunk_tool.MAX_CHUNK_SIZE
+        self._base_min = min_size if min_size is not None else chunk_tool.MIN_CHUNK_SIZE
+        assert 0 < self._base_target <= self._base_max, "target 必须 <= max_size"
         self.overlap = overlap
+        # 显式定制参数表示调用方有自己的预算，不做形态自适应
+        self.adaptive = adaptive and (target is None and max_size is None and min_size is None)
+        self.target = self._base_target
+        self.max_size = self._base_max
+        self.min_size = self._base_min
+
+    # ---------- 文档形态自适应 ----------
+    def _apply_doc_profile(self, md: str, blocks: list[chunk_tool.Block]) -> None:
+        """按围栏/表格密度选择生效参数；纯散文保持默认。
+
+        代码密集文档（围栏+表格字符占比 >= CODE_DENSE_THRESHOLD）：
+            target 400 -> 600，让相邻代码块装进同块；min_size 同步下调。
+        每次 chunk() 调用从基准参数重算，不会污染后续文档。
+        """
+        target, max_size, min_size = self._base_target, self._base_max, self._base_min
+        if self.adaptive and self._is_code_dense(md, blocks):
+            target = chunk_tool.CODE_DENSE_TARGET
+            max_size = chunk_tool.CODE_DENSE_MAX
+            min_size = min(chunk_tool.CODE_DENSE_MIN, min_size)
+        self.target, self.max_size, self.min_size = target, max_size, min_size
+
+    @staticmethod
+    def _is_code_dense(md: str, blocks: list[chunk_tool.Block]) -> bool:
+        """围栏/表格字符占比检测（frontmatter/hr 不计）。"""
+        total = max(len(md), 1)
+        dense = sum(len(b.content) for b in blocks if b.type in ("code", "table"))
+        return dense / total >= chunk_tool.CODE_DENSE_THRESHOLD
 
     # ---------- 主入口 ----------
     def chunk(self, md: str) -> list[Chunk]:
         blocks = chunk_tool.parse_markdown(md)
+        self._apply_doc_profile(md, blocks)
         out: list[Chunk] = []
         for path, section in self._split_sections(blocks):
             units = self._pack_blocks(section, path) 	#section:list[Block] , path:(str, ...)
             out.extend(self._apply_overlap(units))
         out = self._merge_small(out)
+        self._mark_fragments(out)
         for i, c in enumerate(out):
             c.index = i
         return out
@@ -306,18 +340,50 @@ class MarkdownChunker:
         flush()
         return chunks
 
-    # ---------- 重叠：吸附到句子边界 ----------
+    # ---------- 重叠：句尾吸附句子边界，标题/代码块取标题行或代码末行 ----------
     def _apply_overlap(self, units: list[Chunk]) -> list[Chunk]:
         prev: Chunk|None = None
         for u in units:
-            if prev is not None and self.overlap > 0 and \
-                    any(t in ("paragraph", "list", "quote") for t in prev.block_types):
-                tail = self._tail(prev.core, self.overlap)
+            if prev is not None and self.overlap > 0:
+                tail = self._overlap_prefix(prev)
                 if tail:
                     u.prefix = tail
                     u.overlap_tokens = chunk_tool.predic_token(tail)
             prev = u
         return units
+
+    def _overlap_prefix(self, prev: Chunk) -> str:
+        """重叠前缀来源（按上一块的块类型降级，代码/围栏密集文档也能获得上下文衔接）：
+
+        1. 含 paragraph/list/quote -> 尾部句子（吸附句子边界，原有行为）；
+        2. 含 heading -> 标题行作为上下文锚点（取最贴近当前块的那行）；
+        3. 含 code -> 代码末行（按行截取，不按句切，避免破坏代码语义）。
+        """
+        types = set(prev.block_types)
+        if types & {"paragraph", "list", "quote"}:
+            return self._tail(prev.core, self.overlap)
+        if "heading" in types:
+            heading_lines = [ln.strip() for ln in prev.core.split("\n") if chunk_tool._HEADING.match(ln)]
+            if heading_lines:
+                return heading_lines[-1]
+        if "code" in types:
+            return self._code_tail(prev.core, self.overlap)
+        return ""
+
+    def _code_tail(self, text: str, budget: int) -> str:
+        """取代码块末尾若干行（行级，不做句子切分；剔除围栏标记行）。"""
+        lines = [ln for ln in text.split("\n")
+                 if ln.strip() and not chunk_tool._FENCE.match(ln)]
+        picked: list[str] = []
+        total = 0
+        for ln in reversed(lines):
+            tk = chunk_tool.predic_token(ln)
+            if picked and total + tk > budget:
+                break
+            picked.append(ln)
+            total += tk
+        picked.reverse()
+        return "\n".join(picked)
 
     def _tail(self, text: str, budget: int) -> str:
         sents = chunk_tool.split_sentences(text)
@@ -333,23 +399,59 @@ class MarkdownChunker:
         joiner = "" if chunk_tool._HAS_CJK.search(text) else " "
         return joiner.join(picked)
 
-    # ---------- 小块合并：避免碎片 ----------
+    # ---------- 小块合并：避免碎片（放宽版） ----------
     def _merge_small(self, chunks: list[Chunk]) -> list[Chunk]:
+        """小块合并（放宽版，解决 9~30 token 碎块）：
+
+        - 小于 min_size 的块先尝试并入前块：允许跨根标题，合并后 <= max_size；
+        - 前块放不下则并入后块（小块在前，保持原文顺序）；
+        - 两者都放不下则保持独立，由 _mark_fragments() 打碎块标记。
+        """
+        # 前向合并：小块并入前块（跨根标题允许）
         merged: list[Chunk] = []
         for c in chunks:
-            if (merged
-                    and chunk_tool.predic_token(c.core) < self.min_size
-                    and merged[-1].heading_path[:1] == c.heading_path[:1]
-                    and chunk_tool.predic_token(merged[-1].core + c.core) <= self.target):
-                p = merged[-1]
-                p.core = p.core + "\n\n" + c.core
-                p.end = max(p.end, c.end)
-                p.block_types = p.block_types + c.block_types
-                p.overlap_tokens = 0
-                p.prefix = ""
+            if merged and self._can_merge(merged[-1], c) \
+                    and chunk_tool.predic_token(c.core) < self.min_size:
+                self._absorb(merged[-1], c)
             else:
                 merged.append(c)
-        return merged
+
+        # 后向合并：仍过小的块并入后块
+        out: list[Chunk] = []
+        i, n = 0, len(merged)
+        while i < n:
+            c = merged[i]
+            if (chunk_tool.predic_token(c.core) < self.min_size
+                    and i + 1 < n and self._can_merge(c, merged[i + 1])):
+                self._absorb(merged[i + 1], c, prepend=True)
+                i += 1                      # c 已并入 merged[i+1]，跳过
+                continue
+            out.append(c)
+            i += 1
+        return out
+
+    def _can_merge(self, a: Chunk, b: Chunk) -> bool:
+        return chunk_tool.predic_token(a.core + "\n\n" + b.core) <= self.max_size
+
+    @staticmethod
+    def _absorb(host: Chunk, other: Chunk, prepend: bool = False) -> None:
+        """将 other 并入 host：prepend=True 时 other 在前（后向合并）。"""
+        if prepend:
+            host.core = other.core + "\n\n" + host.core
+            host.start = min(host.start, other.start)
+            host.block_types = other.block_types + host.block_types
+        else:
+            host.core = host.core + "\n\n" + other.core
+            host.end = max(host.end, other.end)
+            host.block_types = host.block_types + other.block_types
+        host.overlap_tokens = 0
+        host.prefix = ""
+
+    # ---------- 碎块兜底标注 ----------
+    def _mark_fragments(self, chunks: list[Chunk]) -> None:
+        """合并后仍 < FRAGMENT_TOKENS 的块打碎块标记，检索侧降权（见 HybridRetriever）。"""
+        for c in chunks:
+            c.fragment = chunk_tool.predic_token(c.core) < chunk_tool.FRAGMENT_TOKENS
 
 
 # ============================================================
@@ -365,4 +467,5 @@ def to_records(chunks: list[Chunk], doc_id: str) -> list[dict]:
         "char_end": c.end,
         "tokens": c.tokens,
         "overlap_tokens": c.overlap_tokens,
+        "fragment": c.fragment,
     } for c in chunks]

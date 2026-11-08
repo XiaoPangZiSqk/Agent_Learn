@@ -8,7 +8,7 @@
 
 `bm25_retriever.py` 与 `fts5_retriever.py` 是**关键词召回**通道的两个实现：前者用「本地分词缓存 + 内存 BM25 统计量」，
 后者用「SQLite FTS5 单文件倒排索引」。两者都对 chunk 文本做词项匹配，与 `vector_store` 的稠密向量召回互为补充，
-最终由融合层（尚未实现）合并各路结果。两者消费同一批 records、返回同一结构，可以互换或并列使用。
+最终由融合层（同目录 `retriever.py` 的 `HybridRetriever`，RRF 按排名融合）合并各路结果。两者消费同一批 records、返回同一结构，可以互换或并列使用。
 
 - 第一至十章：`bm25_retriever.py`（BM25 本地缓存方案）
 - 第十一章：`fts5_retriever.py`（SQLite FTS5 方案）
@@ -248,7 +248,7 @@ sparse = bm25.search(query, top_k=20)
 |---|---|---|---|
 | 打分器 | 内置 `_BM25Index` | 替换为 `rank_bm25` 适配器，或 `bm25s` | 保持 `get_scores(tokens) -> list[float]` 接口 |
 | 分词器 | 直接导入 `core_line.embedding.tokenizer` | 改为构造参数注入 | 版本号必须与缓存 meta 同步 |
-| 融合层 | 未实现 | 新增 `fusion.py`，用 RRF 按排名融合 | BM25 与 cosine 分数量纲不同，不要直接相加 |
+| 融合层 | 已实现 | `retriever.py` 的 `HybridRetriever`，RRF 按排名融合（`rrf_k=60`，带通道权重与碎块降权） | BM25 与 cosine 分数量纲不同，不要直接相加 |
 | 字段加权 | 未实现 | 写入时把 `heading_path` 词项重复计入，或拆多字段 BM25 | 会改变 tf 分布，需重新评估 |
 | 增量更新 | 按文档覆盖 | 已支持 `build(records)` 单文档更新 | 真正的增量 IDF 更新未实现，规模大时仍建议批量重建 |
 | 服务化 | 单机本地缓存 | 多实例时改为共享检索服务（ES/OpenSearch） | 本地 pickle 无法跨节点共享 |
