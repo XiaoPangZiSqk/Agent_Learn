@@ -41,10 +41,22 @@ logger = logging.getLogger(__name__)
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
+def _resolve_persist_dir() -> Path:
+    """解析 CHROMA_PERSIST_DIR：缺省 RAG/data/chroma_data；相对路径锚定 RAG 项目根。
+
+    注意不能按 cwd 解析——从 RAG/src 运行时会落到 RAG/src/data 下。
+    """
+    raw = (os.getenv("CHROMA_PERSIST_DIR") or "").strip()
+    if not raw:
+        return _PROJECT_ROOT / "data" / "chroma_data"
+    path = Path(raw).expanduser()
+    return path if path.is_absolute() else _PROJECT_ROOT / path
+
+
 class ChromaVector:
     """Chroma 本地持久化向量库：负责 chunk 记录的写入、读取与相似度检索。"""
 
-    DEFAULT_PERSIST_DIR = Path(os.getenv("CHROMA_PERSIST_DIR", str(_PROJECT_ROOT / "data/chroma_data")))
+    DEFAULT_PERSIST_DIR = _resolve_persist_dir()
     DEFAULT_COLLECTION = os.getenv("CHROMA_COLLECTION_NAME", "rag_chunks")
     DEFAULT_TOP_K = 5
     WRITE_BATCH_SIZE = 64        # 单次 upsert 条数（embedding 侧还会按模型上限二次分批）

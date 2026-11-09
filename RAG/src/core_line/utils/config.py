@@ -121,7 +121,9 @@ def get_bailian_base_url() -> str | None:
 
 # ----------------------------------------------------------------- 缓存 / 生成模式
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]   # RAG/
+# RAG 项目根目录：.../RAG/src/core_line/utils/config.py -> .../RAG
+# 注意：config.py 在 core_line/utils/ 下，需取 parents[3]（在 core_line/ 下时才是 parents[2]）
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CACHE_PATH = _PROJECT_ROOT / "data" / "cache" / "rag_cache.db"
 
 
@@ -131,9 +133,13 @@ def get_cache_enabled() -> bool:
 
 
 def get_cache_path() -> Path:
-    """语义缓存库文件路径：RAG_CACHE_PATH，缺省 data/cache/rag_cache.db。"""
+    """语义缓存库文件路径：RAG_CACHE_PATH，缺省 RAG/data/cache/rag_cache.db。
+
+    相对路径以 RAG 项目根为基准锚定，不随运行目录（cwd）变化。
+    """
     raw = (os.getenv("RAG_CACHE_PATH") or "").strip()
-    return Path(raw or DEFAULT_CACHE_PATH).expanduser()
+    path = Path(raw).expanduser() if raw else DEFAULT_CACHE_PATH
+    return path if path.is_absolute() else _PROJECT_ROOT / path
 
 
 def get_cache_ttl_days() -> int:
