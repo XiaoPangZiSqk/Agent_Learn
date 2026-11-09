@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 try:  # 以 RAG/src 为导入根（与 RagApp.py 保持一致）
-    from core_line.config import get_cache_enabled, get_cache_path, get_cache_ttl_days
+    from core_line.utils.config import get_cache_enabled, get_cache_path, get_cache_ttl_days
 except ImportError:  # 作为包的一部分导入时的兜底
     from .config import get_cache_enabled, get_cache_path, get_cache_ttl_days
 

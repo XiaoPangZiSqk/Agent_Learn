@@ -105,9 +105,9 @@ except ImportError:
     OpenAI = None  # type: ignore[assignment]
     ChatCompletionMessageParam = dict  # type: ignore[assignment,misc]
 
-from core_line.cache import SemanticCache, get_default_cache
-from core_line.cache import make_key, normalize_query, text_fingerprint
-from core_line.config import get_generator_fast_mode, get_generator_sc_model
+from core_line.utils.cache import SemanticCache, get_default_cache
+from core_line.utils.cache import make_key, normalize_query, text_fingerprint
+from core_line.utils.config import get_generator_fast_mode, get_generator_sc_model
 from core_line.generate.context_assembler import AssembledContext
 
 load_dotenv()

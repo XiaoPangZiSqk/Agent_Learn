@@ -25,7 +25,7 @@
 | Markdown 结构化切分 | 可用 | `MarkdownChunker`，边界感知 + 重叠 + 小块合并 + 形态自适应 + 碎块标注 |
 | 记录标准化 | 可用 | `to_records()` 产出双通道共用的记录结构 |
 | 向量索引与检索 | 可用 | `ChromaVector`，本地持久化、cosine 距离 |
-| 关键词索引与检索 | 可用 | `BM25Retriever`，本地分词缓存 + 内存 BM25 统计 |
+| 关键词索引与检索 | 可用 | `BM25Retriever`，本地分词缓存 + 内存 BM25 统计。可替换为fts5_retriever.py |
 | 构建流程编排 | 部分可用 | `RagApp.py` 目前执行“启动预检 → 加载 → 切分 → 打印”，尚未写入两个索引 |
 | 双路融合（RRF） | 可用 | `HybridRetriever`，按排名 RRF 融合（`rrf_k=60`），带通道权重与碎块降权 |
 | 重排（rerank） | 可用 | `CrossEncoderReranker` + `BaiLianRerankScorer`（百炼 rerank），打分失败自动降级 RRF 排序 |

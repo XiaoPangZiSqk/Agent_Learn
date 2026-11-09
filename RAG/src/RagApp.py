@@ -1,41 +1,56 @@
 """
-RAG入口文件
+RAG入口文件：组合离线端构建与在线端查询。
+
+两个子命令：
+    build   离线端构建（offline_build.py）：加载 → 切分 → 双通道落库
+            （向量 Chroma + 关键词 FTS5）
+    query   在线端查询（online_query.py）：双路召回 → RRF 融合 → 交叉重排 → 生成
+
+用法（在 RAG/src 目录下执行）：
+    python RagApp.py build [--source DIR] [--rebuild]   # 离线构建索引
+    python RagApp.py query "K-means 的原理是什么？"      # 单次查询
+    python RagApp.py query                              # 交互式循环，q 退出
+
+各子命令的参数定义在 offline_build.py / online_query.py 内（单一来源），
+本入口只做分发，参数原样透传；子命令帮助见：
+    python RagApp.py build -h / python RagApp.py query -h
+
+也可以直接调用两个模块：
+    python offline_build.py / python online_query.py
 """
 
+from __future__ import annotations
+
 import sys
-from pathlib import Path
 
-from core_line.config import ConfigError, preflight
-from core_line.load_file.load_data import LoadData
-from chunker.markdown_chunker import MarkdownChunker, to_records
+from offline_build import main as build_main
+from online_query import main as query_main
 
-# 启动预检：必需配置（key / model / base_url）缺失或非法时，
-# 立刻报出具体变量名，而不是拖到第一次 API 调用才失败（见 core_line/config.py）
-try:
-    _config = preflight()
-except ConfigError as exc:
-    print(f"[配置预检失败] {exc}")
-    sys.exit(1)
-print(f"[配置] 预检通过 | {_config.summary()}")
+USAGE = __doc__
 
-file_path = Path(__file__).resolve().parents[1]/"data/load_file/"
+COMMANDS = {
+    "build": build_main,
+    "query": query_main,
+}
 
 
-md_load = LoadData()
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    if not argv or argv[0] in ("-h", "--help"):
+        print(USAGE.strip())
+        return 0
+
+    command, rest = argv[0], argv[1:]
+    handler = COMMANDS.get(command)
+    if handler is None:
+        print(f"[错误] 未知子命令: {command}", file=sys.stderr)
+        print(USAGE.strip(), file=sys.stderr)
+        return 2
+
+    # 子命令参数原样透传，由各模块的 argparse 解析（help/校验不重复定义）
+    return handler(rest)
 
 
-md_document = md_load.load_file(file_path)
-
-# for document in md_document :
-#     print(document.page_content)
-#     print("".join("=" for _ in range(200)))
-
-md_chunker = MarkdownChunker()
-
-for document in md_document :
-    chunks = md_chunker.chunk(document.page_content)
-    datas = to_records(chunks, document.metadata["file_name"])
-    for data in datas :
-        print(f"doc_id:{data['doc_id']}。 路径：{data['heading_path']}\n 内容：{data['text']}\n\n")
-
-    print("".join("=" for _ in range(200)))
+if __name__ == "__main__":
+    sys.exit(main())

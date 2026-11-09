@@ -22,15 +22,15 @@ from http import HTTPStatus
 import dashscope
 
 try:  # 以 RAG/src 为导入根（与 RagApp.py 保持一致）
-    from core_line.config import bailian_key_hint, find_bailian_api_key
-    from core_line.config import get_bailian_base_url, get_embedding_model
-    from core_line.cache import SemanticCache, get_default_cache
-    from core_line.cache import make_key, text_fingerprint
+    from core_line.utils.config import bailian_key_hint, find_bailian_api_key
+    from core_line.utils.config import get_bailian_base_url, get_embedding_model
+    from core_line.utils.cache import SemanticCache, get_default_cache
+    from core_line.utils.cache import make_key, text_fingerprint
 except ImportError:  # 作为包的一部分导入时的兜底
-    from ..config import bailian_key_hint, find_bailian_api_key
-    from ..config import get_bailian_base_url, get_embedding_model
-    from ..cache import SemanticCache, get_default_cache
-    from ..cache import make_key, text_fingerprint
+    from ..utils.config import bailian_key_hint, find_bailian_api_key
+    from ..utils.config import get_bailian_base_url, get_embedding_model
+    from ..utils.cache import SemanticCache, get_default_cache
+    from ..utils.cache import make_key, text_fingerprint
 
 logger = logging.getLogger(__name__)
 
