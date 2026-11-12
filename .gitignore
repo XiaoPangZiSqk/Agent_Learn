@@ -2,13 +2,11 @@
 .env
 
 # 向量库本地数据(由 build_index 生成,可随时重建)
-data/chroma_data/
-data/bm25_index/
-data/fts5_index/
-data/cache/
-
-# 合成测试数据(由 scripts/generate_synthetic_data.py 生成,不入库)
-data/load_file/
+RAG/data/chroma_data/
+RAG/data/bm25_index/
+RAG/data/fts5_index/
+RAG/data/cache/
+RAG/data/load_file/
 
 # Python
 __pycache__/
